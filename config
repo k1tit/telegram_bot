@@ -1,0 +1,161 @@
+```
+from dotenv import load_dotenv
+import os
+import asyncio
+import hmac
+import hashlib
+import base64
+import urllib.parse
+import random
+import string
+import aiohttp
+from aiogram import Bot, Dispatcher, Router
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import Command
+from googletrans import Translator  
+
+load_dotenv()
+
+# Получаем токены и ключи из переменных окружения
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+FATSECRET_CLIENT_ID = os.getenv("FATSECRET_CLIENT_ID")
+FATSECRET_CLIENT_SECRET = os.getenv("FATSECRET_CLIENT_SECRET")
+
+# Инициализация бота и других объектов
+bot = Bot(token=TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+router = Router()
+
+translator = Translator()
+
+keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text='/start'), KeyboardButton(text='Узнать КБЖУ')],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False
+)
+
+@router.message(Command("start"))
+async def send_welcome(msg: Message):
+    await msg.answer(f'Привет, {msg.from_user.first_name}! Я бот Calori - Bot!', reply_markup=keyboard)
+    await msg.answer('Напиши мне название продукта, например, "Куриная грудка", и я расскажу тебе о его КБЖУ!')
+
+@router.message(lambda message: message.text == 'Узнать КБЖУ')
+async def prompt_for_product_name(msg: Message):
+    await msg.answer("Введи название продукта", reply_markup=keyboard)
+
+def generate_nonce(length=8):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
+async def get_access_token():
+    url = 'https://oauth.fatsecret.com/connect/token'
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+    data = {
+        'grant_type': 'client_credentials',
+        'client_id': FATSECRET_CLIENT_ID,
+        'client_secret': FATSECRET_CLIENT_SECRET,
+        'scope': 'basic'
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=data) as response:
+                if response.status == 200:
+                    token_info = await response.json()
+                    return token_info['access_token']
+                else:
+                    print(f"Failed to obtain access token: {response.status}")
+                    return None
+    except aiohttp.ClientError as e:
+        print(f"Failed to obtain access token: {e}")
+        return None
+
+async def translate_to_english(text):
+    try:
+        translation = translator.translate(text, dest='en')
+        return translation.text
+    except Exception as e:
+        print(f"Translation failed: {e}")
+        return text  
+
+# Обработчик сообщения с названием продукта
+@router.message(lambda message: message.text)
+async def nutrition_product(msg: Message):
+    product_name = msg.text.strip()
+    
+    product_name_english = await translate_to_english(product_name)
+    print(f"Translated product name to English: {product_name_english}")
+    
+    access_token = await get_access_token()
+    
+    if access_token:
+        info = await get_fatsecret_data(product_name_english, access_token)
+        await msg.answer(info, reply_markup=keyboard)
+    else:
+        await msg.answer("Произошла ошибка при получении токена доступа.")
+
+# Функция для получения данных по продукту от FatSecret
+async def get_fatsecret_data(product_name, access_token):
+    url = 'https://platform.fatsecret.com/rest/server.api'
+    headers = {'Authorization': f'Bearer {access_token}'}
+    params = {
+        'method': 'foods.search',
+        'search_expression': product_name,
+        'format': 'json',
+        'language': 'en',
+        'region': 'en'
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if 'foods' in data and int(data['foods']['total_results']) > 0:
+                        food = data['foods']['food'][0]  # Берем первый продукт
+                        name = food.get('food_name', 'Неизвестный продукт')
+                        food_description = food.get('food_description', '')
+
+                        calories = proteins = fats = carbs = None
+                        for part in food_description.split('|'):
+                            part = part.strip()
+                            if "Calories" in part:
+                                calories = part.split(":")[1].strip()
+                            elif "Protein" in part:
+                                proteins = part.split(":")[1].strip()
+                            elif "Fat" in part:
+                                fats = part.split(":")[1].strip()
+                            elif "Carbs" in part:
+                                carbs = part.split(":")[1].strip()
+
+                        calories = calories or "не указано"
+                        proteins = proteins or "не указано"
+                        fats = fats or "не указано"
+                        carbs = carbs or "не указано"
+
+                        message = (
+                            f"Пищевая ценность {name}:\n"
+                            f"Калории: {calories}\n"
+                            f"Белки: {proteins}\n"
+                            f"Жиры: {fats}\n"
+                            f"Углеводы: {carbs}"
+                        )
+                        return message
+                    else:
+                        return "Продукт не найден."
+                else:
+                    return f"Ошибка: не удалось получить данные. Статус: {response.status}"
+    except aiohttp.ClientError as e:
+        print(f"Ошибка при запросе к API: {e}")
+        return f"Произошла ошибка при запросе к API: {str(e)}"
+
+async def main():
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+```
